@@ -1,4 +1,3 @@
-# %%
 # -*- coding: utf-8 -*-
 # Python 3.9.6
 # pip install requests==2.32.3 python-dotenv==1.0.1 pybit==5.7.0
@@ -425,6 +424,21 @@ class FundingArbBot:
         self.legs: Tuple[Optional[Leg], Optional[Leg]] = (None, None)
         self.regime: Optional[str] = None   # "MAIN" / "BIAS" / None
 
+    def _current_sides(self) -> Tuple[Optional[str], Optional[str]]:
+        """
+        現在の Aster / Bybit のサイドを返す ("LONG"/"SHORT"/None)。
+        legs が無ければポジションから推定する。
+        """
+        legA, legB = self.legs
+        a_qty, a_ep, b_qty, b_ep = self._get_positions()
+
+        if legA and legB:
+            return legA.side, legB.side
+
+        ast_side = "LONG" if a_qty > 0 else ("SHORT" if a_qty < 0 else None)
+        byb_side = "LONG" if b_qty > 0 else ("SHORT" if b_qty < 0 else None)
+        return ast_side, byb_side
+
     def _decide_sides_by_premium(self, premium: float) -> tuple[str, str, str]:
         """
         premium >  PREM_ENTER → MAIN:  Aster SHORT / Bybit LONG
@@ -709,32 +723,53 @@ class FundingArbBot:
     def run(self):
         while True:
             try:
+                # 次の分境界 +3秒まで待機（確定足のみ扱う）
                 sleep_until_next_minute_plus(MINUTE_DELAY_SEC)
 
+                # 直近確定足の close を取得（内部で5秒リトライ）
                 c_ast, c_byb, ts = self._fetch_last_closed_closes_with_retry()
                 if c_ast is None or c_byb is None:
                     print("[skip] closed bars not found after retries")
                     continue
 
+                # プレミアム計算＆ログ（計算に使った価格も出力）
                 premium = (c_ast / c_byb) - 1.0
                 print(f"[calc {ts}] Aster={c_ast:.6f}, Bybit={c_byb:.6f} → premium={premium:+.6%}")
 
+                # 片足だけ消えていたら＝ロスカ/SL/障害等 → 即全クローズ（次の確定足まで様子見）
                 if LIQUIDATION_GUARD and self.hedge_break_detected():
                     print(f"[hedge_break {ts}] one side missing → closing all")
                     self.close_all("hedge_break")
                     continue
 
-                in_band = (PREM_EXIT <= premium <= PREM_ENTER)
-                legA, legB = self.legs
-                has_pos = (legA is not None and legB is not None)
+                # 現体勢を把握
+                ast_side, byb_side = self._current_sides()
+                has_pos = (ast_side is not None and byb_side is not None)
 
-                if not has_pos:
-                    # フラット → MAIN条件 or BIAS条件で入る
+                # 目標体勢を決定
+                # ENTER超え → MAIN(SHORT/LONG), EXIT割れ → MAIN(LONG/SHORT), 中立帯 → BIAS(LONG/SHORT)
+                if premium >= PREM_ENTER:
+                    target_ast, target_byb, target_regime = "SHORT", "LONG", "MAIN"
+                elif premium <= PREM_EXIT:
+                    target_ast, target_byb, target_regime = "LONG", "SHORT", "MAIN"
+                else:
+                    target_ast, target_byb, target_regime = "LONG", "SHORT", "BIAS"  # 中立帯は常にBIAS
+
+                # 体勢が違えば必ずドテン（close→open）
+                if (ast_side, byb_side) != (target_ast, target_byb):
+                    if has_pos:
+                        print(f"[reverse {ts}] {ast_side or '-'}→{target_ast} / {byb_side or '-'}→{target_byb} prem={premium:+.3%}")
+                        self.close_all("spread_reverse")
+                    # 同じ確定足の価格で新方向を建てる
                     self.open_basket(premium, c_ast, c_byb, ts)
                 else:
-                    # regime に基づくドテン/HOLD（あなたの前回ロジックのままでOK）
-                    # --- 略（既存の MAIN/BIAS 分岐） ---
-                    ...
+                    # 同体勢ならホールド
+                    if target_regime == "MAIN":
+                        print(f"[hold {ts}] MAIN {target_ast} prem={premium:+.3%}")
+                    else:
+                        print(f"[hold {ts}] BIAS prem={premium:+.3%}")
+
+                # 長時間保有の周期リセット（必要に応じて）
                 if self.check_cycle_reset():
                     self.close_all("cycle_reset_1.5h")
 
@@ -794,9 +829,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# %%
-
-
-
